@@ -225,21 +225,22 @@ def count(r):
     return "-"
 
 
-def first_entry_value(r, field):
-    """Pull one field out of the first entry of a Unisphere collection response, if present.
-
-    Handles both possible shapes for a `compact=True` collection response: the standard `{"entries": [...]}`
-    wrapper, and a bare top-level array `[{"content": {...}}, ...]` - a real `compact=True` example response
-    this script was checked against was ambiguous between the two (it showed a single `{"content": {...}},`
-    element with a trailing comma, consistent with either shape), so both are handled defensively rather than
-    assuming one.
-    """
+def all_entry_values(r, field):
+    """Walk every entry of a Unisphere collection response and collect every distinct (order-preserved) value
+    seen for `field` - handles both response shapes (`{"entries": [...]}` and a bare top-level array). Used to
+    collect every metric path the catalog returns rather than arbitrarily using only the first one."""
     j = r["json"]
     entries = j.get("entries") if isinstance(j, dict) else j if isinstance(j, list) else None
-    if isinstance(entries, list) and entries:
-        content = entries[0].get("content") or {}
-        return content.get(field)
-    return None
+    values = []
+    seen = set()
+    if isinstance(entries, list):
+        for e in entries:
+            content = e.get("content") or {}
+            v = content.get(field)
+            if v and v not in seen:
+                seen.add(v)
+                values.append(v)
+    return values
 
 
 def discover_fields(opener, base, csrf, creds, res, resource_type):
@@ -319,7 +320,7 @@ def unity_post(opener, base, path, csrf, body):
 
 
 def query_with_fallback(opener, base, csrf, creds, res, resource, discovered_fields, curated_fields, extra=None,
-                         show_body=True):
+                         show_body=True, per_page=PER_PAGE):
     """Same ladder as PowerStore's ps_collection(): try the richest field set first; if the array rejects it
     (400 - e.g. a discovered attribute name it won't actually accept in fields=), fall back to a smaller,
     known-safe set; if that also fails, fall back to id only. Stops at the first response that isn't a 400,
@@ -331,6 +332,10 @@ def query_with_fallback(opener, base, csrf, creds, res, resource, discovered_fie
     fail for the same reason and wrongly mark the endpoint as failed. So after the field-list ladder is
     exhausted, one last retry drops `per_page`/`page` entirely (plain `id` only) to isolate that case before
     giving up on the endpoint.
+
+    `per_page` defaults to the module-level PER_PAGE cap; pass `per_page=None` to omit `per_page`/`page`
+    entirely and fall back to the array's own default page size (2000, per Dell_Unity_XT_Research.md:1026) -
+    used for the `metric` catalog call so every metric path is seen, not just the first PER_PAGE of them.
     """
     tiers = []
     if discovered_fields:
@@ -341,8 +346,11 @@ def query_with_fallback(opener, base, csrf, creds, res, resource, discovered_fie
 
     r = None
     for label, fields in tiers:
-        query = "/api/types/%s/instances?compact=True&fields=%s&per_page=%d&page=1" % (
-            resource, ",".join(fields), PER_PAGE)
+        if per_page is not None:
+            query = "/api/types/%s/instances?compact=True&fields=%s&per_page=%d&page=1" % (
+                resource, ",".join(fields), per_page)
+        else:
+            query = "/api/types/%s/instances?compact=True&fields=%s" % (resource, ",".join(fields))
         if extra:
             query += "&" + extra
         r, csrf = unity_get(opener, base, q(query), csrf, creds, res, show_body=show_body)
@@ -394,7 +402,7 @@ def run_fixed_query(opener, base, csrf, creds, res, name, path):
 
 
 def unity_performance(opener, base, csrf, creds, res):
-    say("  -- Performance (metric / metricValue / metricRealTimeQuery / metricQueryResult) --")
+    say("  -- Performance (metric / metricValue, historical data only) --")
     res["endpoints_total"] += 1
     fields, csrf, meta_r = discover_fields(opener, base, csrf, creds, res, "metric")
     if fields:
@@ -402,65 +410,38 @@ def unity_performance(opener, base, csrf, creds, res):
             % (short(meta_r), len(fields), ", ".join(fields)))
     else:
         say("  [Unity XT] GET /api/types/metric       -> %s, could not discover attributes" % short(meta_r))
+    # per_page=None deliberately - pull the catalog in full (array default page size, 2000 per
+    # Dell_Unity_XT_Research.md:1026) so every metric path is seen, not just the first PER_PAGE of them.
     cat, csrf = query_with_fallback(opener, base, csrf, creds, res, "metric", fields, CURATED_FIELDS.get("metric"),
-                                     show_body=False)
+                                     show_body=False, per_page=None)
     if cat["status"] != 200:
         res["endpoints_failed"].append("metric")
 
-    path = first_entry_value(cat, "path")
-    res["endpoints_total"] += 2  # metricValue + metricRealTimeQuery, attempted or not
-    if not path:
-        say("  [Unity XT] metricValue / metricRealTimeQuery -> skipped, no metric path discovered from catalog")
+    paths = all_entry_values(cat, "path")
+    res["endpoints_total"] += len(paths) if paths else 1  # metricValue, one attempt per discovered path
+    if not paths:
+        say("  [Unity XT] metricValue -> skipped, no metric paths discovered from catalog")
         res["endpoints_failed"].append("metricValue")
-        res["endpoints_failed"].append("metricRealTimeQuery")
         return csrf
 
+    say("  [Unity XT] %d metric path(s) discovered - pulling up to %d historical sample(s) each via metricValue"
+        % (len(paths), PER_PAGE))
     mv_fields, csrf, mv_meta = discover_fields(opener, base, csrf, creds, res, "metricValue")
     if mv_fields:
         say("  [Unity XT] GET /api/types/metricValue    -> %s, %d attributes discovered: %s"
             % (short(mv_meta), len(mv_fields), ", ".join(mv_fields)))
     else:
         say("  [Unity XT] GET /api/types/metricValue    -> %s, could not discover attributes" % short(mv_meta))
-    mv, csrf = query_with_fallback(opener, base, csrf, creds, res, "metricValue", mv_fields,
-                                    CURATED_FIELDS.get("metricValue"), extra='filter=path EQ "%s"' % path)
-    if mv["status"] != 200:
-        res["endpoints_failed"].append("metricValue")
 
-    real_time_interval = 60
-    post = unity_post(opener, base, "/api/types/metricRealTimeQuery/instances", csrf,
-                       body={"paths": [path], "interval": real_time_interval})
-    say("  [Unity XT] POST /api/types/metricRealTimeQuery/instances (path=%s) -> %s" % (path, short(post)))
-    query_id = None
-    content = post["json"].get("content") if isinstance(post["json"], dict) else None
-    if content:
-        query_id = content.get("id")
-    res["endpoints_total"] += 1  # metricQueryResult, attempted or not
-    if post["status"] not in (200, 201) or not query_id:
-        say("  [Unity XT] metricQueryResult -> skipped, no queryId returned")
-        res["endpoints_failed"].append("metricRealTimeQuery")
-        res["endpoints_failed"].append("metricQueryResult")
-        return csrf
-
-    # storops (the only source with concrete timing guidance - see Dell_Unity_XT_Research.md Section 5.8)
-    # recommends waiting MORE than one full sampling interval before the first read, so the array has had a
-    # chance to collect at least one sample. Reading back too early (e.g. after just 1-2s) will reliably come
-    # back with 0 records - not a failure of the endpoint, just a premature read.
-    wait_s = real_time_interval + 5
-    say("  [Unity XT] waiting %ds (one %ds sampling interval + margin, per storops guidance) before reading"
-        " metricQueryResult back..." % (wait_s, real_time_interval))
-    time.sleep(wait_s)
-    qr_fields, csrf, qr_meta = discover_fields(opener, base, csrf, creds, res, "metricQueryResult")
-    if qr_fields:
-        say("  [Unity XT] GET /api/types/metricQueryResult -> %s, %d attributes discovered: %s"
-            % (short(qr_meta), len(qr_fields), ", ".join(qr_fields)))
-    else:
-        say("  [Unity XT] GET /api/types/metricQueryResult -> %s, could not discover attributes" % short(qr_meta))
-    qr, csrf = query_with_fallback(opener, base, csrf, creds, res, "metricQueryResult", qr_fields,
-                                    CURATED_FIELDS.get("metricQueryResult"), extra="filter=queryId EQ %s" % query_id)
-    if qr["status"] != 200:
-        res["endpoints_failed"].append("metricQueryResult")
-    say("  [Unity XT] NOTE: no confirmed cleanup/delete call exists for metricRealTimeQuery (research gap) -"
-        " this query (id=%s) is left open on the array after this script exits." % query_id)
+    mv_failed = 0
+    for path in paths:
+        # per_page stays at the PER_PAGE default here (10) - only the catalog call above is unpaginated.
+        mv, csrf = query_with_fallback(opener, base, csrf, creds, res, "metricValue", mv_fields,
+                                        CURATED_FIELDS.get("metricValue"), extra='filter=path EQ "%s"' % path)
+        if mv["status"] != 200:
+            mv_failed += 1
+    if mv_failed:
+        res["endpoints_failed"].append("metricValue (%d/%d paths failed)" % (mv_failed, len(paths)))
     return csrf
 
 
